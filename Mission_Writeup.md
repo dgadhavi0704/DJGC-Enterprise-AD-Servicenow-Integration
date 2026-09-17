@@ -47,4 +47,45 @@ Per the Operating System's five strategic assets:
 
 ## Next mission this feeds into
 
-Extending this same system with Microsoft Graph (cloud-side session/token revocation, license removal) and Power Automate (approval + failure notification layer) — not a new project, a continuation of this one.
+Applying the same notification pattern to onboarding, and extending with Microsoft Graph for cloud-side identity actions (session revocation, license removal) that on-prem AD can't reach.
+
+---
+
+# Mission 2: Notification & Failure-Visibility Layer (Power Automate)
+
+## Objective
+
+Close the one real gap Mission 1 left open: if the offboarding script failed partway, or silently skipped a ticket, nothing surfaced it beyond a work note someone had to go looking for. Add human-facing visibility without touching the proven AD/ServiceNow logic.
+
+## Real Project
+
+Extended `Invoke-DJGCOffboarding-Final.ps1` with a Power Automate HTTP-triggered flow. The environment constraint shaped the design: DJGC's AD isn't connected to Entra, so there's no data gateway for Power Automate to reach in — the script instead POSTs its result out to Power Automate over plain HTTPS once it's already finished, no new infrastructure required.
+
+## Deliverable
+
+- A Power Automate flow with an HTTP trigger and a Switch control routing three distinct outcomes (Success / Failed / Skipped) to differently-worded emails.
+- A `Send-DJGCNotification` function added to the script, called on real success and on real failure (`catch` block), plus a run-level rollup for skipped tickets (one summary email listing all skips and their reasons, not one email per skip).
+- The notification call is isolated in its own try/catch — a Power Automate outage can never break the actual deprovisioning work.
+
+## Evidence of Applied Learning
+
+- **Recognized when a binary Condition wasn't enough** — the flow started with a True/False Condition (Success vs. Failed), which broke the moment a third real outcome (Skipped) needed its own path. Rebuilt as a Switch rather than nesting a second Condition inside the False branch.
+- **Traced a real ServiceNow 403 to its actual cause** — swapped OAuth users first (reasonable first guess), it didn't fix it; kept investigating instead of stopping there, and found the real issue was the OAuth application's scope configuration having no scopes selected. User permissions were never the problem.
+- **Understood JSON as the shared language across every system touched** — the same `ConvertTo-Json`/`ConvertFrom-Json` pattern already used for ServiceNow carries straight over to Power Automate and (eventually) Graph; one concept, reused, not relearned per integration.
+- **Deliberately did not over-notify** — skipped tickets are expected, routine outcomes, not failures, so they're collected and sent as one rollup per run instead of a separate alert per skip.
+
+## Success Criteria
+
+| Criterion | Result |
+|---|---|
+| Real failure (thrown exception) triggers a distinct alert | Met |
+| Real success triggers a distinct confirmation | Met |
+| Skipped tickets are visible without being treated as failures | Met — single rollup email per run |
+| Notification layer cannot break the core automation if it fails | Met — isolated try/catch around the HTTP call |
+| No new on-prem infrastructure required, given AD isn't Entra-connected | Met — script-initiates-outbound design, no gateway needed |
+
+## What this mission strengthened
+
+- **Automation & AI** — orchestration layer on top of an already-working system, not automation in isolation.
+- **Technical Depth** — real debugging under pressure (403 error against 4 live tickets), traced to root cause instead of guessed at.
+- **Communication** — the notification content itself is written for a human glancing at an inbox, not a log file.

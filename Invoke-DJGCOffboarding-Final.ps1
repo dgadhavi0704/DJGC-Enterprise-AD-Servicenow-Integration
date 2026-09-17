@@ -25,6 +25,36 @@ Import-Module ActiveDirectory
 $DomainDN   = "DC=corp,DC=djgroup,DC=com"
 $DisabledOU = "OU=DJGC-Disabled,$DomainDN"
 
+# Power Automate HTTP trigger URL - keep this out of source control if this
+# script is ever pushed publicly (treat it like a credential, not a secret
+# key exactly, but not something to publish either)
+$PowerAutomateUrl = "PASTE_YOUR_TRIGGER_URL_HERE"
+
+function Send-DJGCNotification {
+    param(
+        [ValidateSet("Success", "Failed", "Skipped")]
+        [string]$Status,
+        [string]$User,
+        [string]$Ticket,
+        [string]$Details
+    )
+
+    $payload = @{
+        status  = $Status
+        user    = $User
+        ticket  = $Ticket
+        details = $Details
+    } | ConvertTo-Json
+
+    try {
+        Invoke-RestMethod -Uri $PowerAutomateUrl -Method Post -Body $payload -ContentType "application/json" -ErrorAction Stop | Out-Null
+    } catch {
+        # Notification failing should never break the actual offboarding run -
+        # log it locally and move on, don't throw
+        Write-Host "  WARNING: notification failed to send - $_" -ForegroundColor Yellow
+    }
+}
+
 # ---------------------------------------------------------------------------
 # 1. Pull open Account Deprecation RITMs
 #    (filtered by catalog item name, not short description - more reliable,
@@ -37,6 +67,8 @@ $uri = "$instance/api/now/table/sc_req_item?sysparm_query=$query&sysparm_fields=
 $openTickets = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
 
 Write-Host "Found $($openTickets.result.Count) open Account Deprecation ticket(s)." -ForegroundColor Cyan
+
+$skippedTickets = @()
 
 # ---------------------------------------------------------------------------
 # 2. Process each ticket
@@ -55,6 +87,7 @@ foreach ($ticket in $openTickets.result) {
 
         if ([string]::IsNullOrWhiteSpace($employeeSysId)) {
             Write-Host "  SKIPPING - no Employee Name set on this ticket" -ForegroundColor Yellow
+            $skippedTickets += "$ticketNumber : no Employee Name set on this ticket"
             $body = @{ work_notes = "Skipped by automation: no Employee Name set on this ticket. Manual review required." } | ConvertTo-Json
             Invoke-RestMethod -Uri "$instance/api/now/table/sc_req_item/$sysId" -Headers $headers -Method Patch -Body $body -ContentType "application/json" -ErrorAction Stop | Out-Null
             continue
@@ -72,6 +105,7 @@ foreach ($ticket in $openTickets.result) {
 
         if ($effectiveEnd.Date -ge $today) {
             Write-Host "  SKIPPING - Effective End Date ($($effectiveEnd.Date.ToShortDateString())) has not fully passed yet" -ForegroundColor Yellow
+            $skippedTickets += "$ticketNumber ($samAccountName): Effective End Date ($($effectiveEnd.Date.ToShortDateString())) not yet passed"
             $body = @{ work_notes = "Not yet processed: Effective End Date ($($effectiveEnd.Date.ToShortDateString())) has not fully passed. Will be picked up automatically once it has." } | ConvertTo-Json
             Invoke-RestMethod -Uri "$instance/api/now/table/sc_req_item/$sysId" -Headers $headers -Method Patch -Body $body -ContentType "application/json" -ErrorAction Stop | Out-Null
             continue
@@ -82,6 +116,7 @@ foreach ($ticket in $openTickets.result) {
 
         if (-not $adUser) {
             Write-Host "  AD user not found - skipping AD actions" -ForegroundColor Red
+            $skippedTickets += "$ticketNumber ($samAccountName): AD account not found"
             $body = @{ work_notes = "Automation could not find AD account '$samAccountName'. No action taken. Manual review required." } | ConvertTo-Json
             Invoke-RestMethod -Uri "$instance/api/now/table/sc_req_item/$sysId" -Headers $headers -Method Patch -Body $body -ContentType "application/json" -ErrorAction Stop | Out-Null
             continue
@@ -90,6 +125,7 @@ foreach ($ticket in $openTickets.result) {
         # -- Already deprecated? Let us know and move on, don't re-process --
         if (-not $adUser.Enabled) {
             Write-Host "  Already deprecated - account is already disabled" -ForegroundColor Yellow
+            $skippedTickets += "$ticketNumber ($samAccountName): already deprecated, no action needed"
             $body = @{ work_notes = "No action needed: '$samAccountName' is already deprecated (account already disabled)." } | ConvertTo-Json
             Invoke-RestMethod -Uri "$instance/api/now/table/sc_req_item/$sysId" -Headers $headers -Method Patch -Body $body -ContentType "application/json" -ErrorAction Stop | Out-Null
             continue
@@ -122,10 +158,22 @@ foreach ($ticket in $openTickets.result) {
         Invoke-RestMethod -Uri "$instance/api/now/table/sc_req_item/$sysId" -Headers $headers -Method Patch -Body $patchBody -ContentType "application/json" -ErrorAction Stop | Out-Null
         Write-Host "  Ticket $ticketNumber updated with results" -ForegroundColor Magenta
 
+        Send-DJGCNotification -Status "Success" -User $samAccountName -Ticket $ticketNumber -Details $summary
+
     } catch {
         Write-Host "  ERROR processing $ticketNumber : $_" -ForegroundColor Red
         Write-Host "  Continuing to next ticket..." -ForegroundColor Yellow
+
+        # $samAccountName may not be set yet if the error happened before we
+        # resolved the employee reference - fall back to something usable
+        $failedUser = if ($samAccountName) { $samAccountName } else { "unresolved" }
+        Send-DJGCNotification -Status "Failed" -User $failedUser -Ticket $ticketNumber -Details "$_"
     }
+}
+
+if ($skippedTickets.Count -gt 0) {
+    $skipSummary = $skippedTickets -join "`n"
+    Send-DJGCNotification -Status "Skipped" -User "N/A" -Ticket "$($skippedTickets.Count) ticket(s)" -Details $skipSummary
 }
 
 Write-Host "`nDone. Processed $($openTickets.result.Count) ticket(s)." -ForegroundColor Magenta

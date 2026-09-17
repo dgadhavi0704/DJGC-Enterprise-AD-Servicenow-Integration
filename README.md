@@ -1,6 +1,6 @@
 # DJGC Enterprise Lab — Identity, Licensing & Offboarding Automation
 
-A self-built enterprise IT lab simulating a mid-size company (**DJ Group of Companies**, fictional — four divisions, 25 employees), built to practice real Microsoft-ecosystem administration and automation, end to end: Active Directory design → security groups & licensing → ServiceNow-integrated offboarding automation using the ServiceNow Table API and PowerShell.
+A self-built enterprise IT lab simulating a mid-size company (**DJ Group of Companies**, fictional — four divisions, 25 employees), built to practice real Microsoft-ecosystem administration and automation, end to end: Active Directory design → security groups & licensing → ServiceNow-integrated offboarding automation using the ServiceNow Table API and PowerShell → a Power Automate notification layer that closes the "did it actually work" gap.
 
 This isn't a tutorial-following exercise — every design decision below was made deliberately, tested, and in a couple of cases, revised after hitting a real wall. Those walls are documented too, not hidden.
 
@@ -24,9 +24,16 @@ flowchart TD
     J --> K[Remove from all security groups]
     K --> L[Move to DJGC-Disabled OU]
     L --> M[Write summary back to ticket<br/>as work note]
+    M --> N[POST result to Power Automate<br/>HTTP trigger]
+    G --> O[[Rollup skip summary<br/>sent once per run]]
+    I --> O
+    N --> P{Switch on status}
+    P -->|Success| Q[Email: completed]
+    P -->|Failed| R[Email: FAILED, needs review]
+    O --> S[Email: N tickets skipped + reasons]
 ```
 
-**Design principle:** every branch writes back to the ticket. Nothing fails silently — a human reviewing the ticket always knows exactly what the automation did or didn't do, and why.
+**Design principle:** every branch writes back to the ticket. Nothing fails silently — a human reviewing the ticket always knows exactly what the automation did or didn't do, and why. The notification layer mirrors this: Success, Failed, and Skipped are three distinct, correctly-routed outcomes, not a single pass/fail flag.
 
 ## What's in this repo
 
@@ -37,7 +44,7 @@ flowchart TD
 | `scripts/New-DJGCUsers.ps1` | Builds 25 users from a CSV roster into the correct OUs and security groups |
 | `scripts/New-DJGCLicenseGroups.ps1` | Creates license-tier security groups and assigns all users based on role |
 | `scripts/New-DJGCServiceNowUsers.ps1` | Seeds matching `sys_user` records in ServiceNow so ticket reference fields resolve to real users, the same way production reference fields work |
-| `scripts/Invoke-DJGCOffboarding-Final.ps1` | The end-to-end automation — see architecture diagram above |
+| `scripts/Invoke-DJGCOffboarding-Final.ps1` | The end-to-end automation, including the Power Automate notification hook — see architecture diagram above |
 | `scripts/DJGC_Employee_Roster.csv` | The 25-user roster driving the AD build (passwords redacted — see note below) |
 
 ## Key technical decisions (and why)
@@ -56,10 +63,23 @@ Initial plan was to use ServiceNow's native MCP connector for a tighter integrat
 
 Falling back to the plain Table API (OAuth + REST) turned out to be the right call anyway: it's the same integration path available in virtually any ServiceNow instance, licensed or not, and it's what the PowerShell/API pattern in this repo is built on.
 
+## Notification layer (Power Automate)
+
+The script's original gap: if it failed halfway, or quietly skipped a ticket, nobody found out unless they happened to open ServiceNow and check. That's now closed without touching the core deprovisioning logic at all — the script POSTs a small JSON payload (`status`, `user`, `ticket`, `details`) to a Power Automate HTTP trigger at the end of each outcome, and a Switch control routes it to the right message:
+
+- **Success** → confirmation email
+- **Failed** → alert email, flagged for manual review
+- **Skipped** (no employee reference, effective date not yet reached, account not found, already deprecated) → these aren't failures, so they don't page anyone individually — they're collected during the run and sent as **one rollup email** at the end ("3 tickets skipped, here's why"), instead of either staying silent or spamming a message per skip.
+
+The notification call is wrapped in its own try/catch, deliberately separate from the AD/ServiceNow logic — if Power Automate is unreachable, that's logged locally and the actual offboarding work is unaffected. Notifications are a layer on top of a working system, not a new way for it to fail.
+
+Architecture-wise this stays on-prem-friendly by design: the on-prem AD environment isn't connected to Entra, so instead of Power Automate reaching into AD (which would need a data gateway or hybrid runbook worker), the direction is reversed — the script calls out to Power Automate over plain HTTPS once it's already done the work. No new infrastructure required.
+
 ## What I'd extend next
 
 - **Microsoft Graph**, for anything the on-prem AD side can't reach — revoking active Entra sign-in sessions/tokens immediately on offboarding (a disabled AD account can still have a live cloud token until it expires), stripping cloud-only group memberships and licenses.
-- **Power Automate**, to wrap the existing script with the orchestration layer it currently lacks — notification on start/failure/completion, and an approval step before deprovisioning fires, rather than the current "runs and logs to the ticket" model with no human alerting on failure.
+- **An approval step** before deprovisioning fires, rather than the current model where the ticket's effective date is the only gate.
+- Applying the same notification pattern to the **onboarding** side, not just offboarding.
 
 ## A note on the data in this repo
 
